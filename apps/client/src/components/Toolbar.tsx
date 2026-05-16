@@ -6,6 +6,10 @@ import type { ToolType } from "@draftboard/shared";
 interface ToolbarProps {
   activeTool: ToolType;
   onSelectTool: (tool: ToolType) => void;
+  onUndo?: () => void;
+  onRedo?: () => void;
+  canUndo?: boolean;
+  canRedo?: boolean;
 }
 
 type ToolOption = { id: ToolType; label: string; icon: React.ReactNode };
@@ -14,6 +18,8 @@ const PEN_TOOLS: ToolOption[] = [
   { id: "pen", label: "Pen", icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 19l7-7 3 3-7 7-3-3z" /><path d="M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z" /><path d="M2 2l7.586 7.586" /><circle cx="11" cy="11" r="2" /></svg> },
   { id: "brush", label: "Painting Brush", icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg> },
   { id: "highlighter", label: "Highlighter", icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z" /><line x1="16" y1="8" x2="2" y2="22" /><line x1="17.5" y1="15" x2="9" y2="6.5" /></svg> },
+  { id: "spray", label: "Spray", icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 14v7h4v-7" /><path d="M6 7V3.5" /><circle cx="14" cy="4" r="1" /><circle cx="18" cy="5" r="1" /><circle cx="16" cy="8" r="1" /><circle cx="19" cy="9" r="1" /><circle cx="14" cy="11" r="1" /><path d="M6 7a4 4 0 0 0-4 4v3h8v-3a4 4 0 0 0-4-4z" /></svg> },
+  { id: "circle_brush", label: "Dot Brush", icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="5" cy="8" r="2.5" /><circle cx="12" cy="5" r="3" /><circle cx="19" cy="9" r="2" /><circle cx="8" cy="15" r="3.5" /><circle cx="16" cy="16" r="2.5" /><circle cx="20" cy="19" r="1.5" /></svg> },
 ];
 
 const SHAPE_TOOLS: ToolOption[] = [
@@ -24,7 +30,7 @@ const SHAPE_TOOLS: ToolOption[] = [
   { id: "arrow", label: "Arrow", icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="5" y1="12" x2="19" y2="12" /><polyline points="12 5 19 12 12 19" /></svg> },
 ];
 
-export function Toolbar({ activeTool, onSelectTool }: ToolbarProps) {
+export function Toolbar({ activeTool, onSelectTool, onUndo, onRedo, canUndo, canRedo }: ToolbarProps) {
   const [flyoutOpen, setFlyoutOpen] = useState<"pen" | "shapes" | null>(null);
   
   // Track last used tool in each group so clicking the main button reselects it
@@ -157,6 +163,30 @@ export function Toolbar({ activeTool, onSelectTool }: ToolbarProps) {
         onClick={() => { onSelectTool("eraser"); setFlyoutOpen(null); }}
       >
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21" /><path d="M22 21H7" /><path d="m5 11 9 9" /></svg>
+      </button>
+
+      <div className="toolbar-divider" />
+
+      {/* Undo */}
+      <button
+        className="toolbar-btn"
+        data-tooltip="Undo (Ctrl+Z)"
+        onClick={() => { onUndo?.(); setFlyoutOpen(null); }}
+        disabled={!canUndo}
+        style={{ opacity: canUndo ? 1 : 0.5, cursor: canUndo ? 'pointer' : 'not-allowed' }}
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7v6h6" /><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13" /></svg>
+      </button>
+
+      {/* Redo */}
+      <button
+        className="toolbar-btn"
+        data-tooltip="Redo (Ctrl+Y)"
+        onClick={() => { onRedo?.(); setFlyoutOpen(null); }}
+        disabled={!canRedo}
+        style={{ opacity: canRedo ? 1 : 0.5, cursor: canRedo ? 'pointer' : 'not-allowed' }}
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 7v6h-6" /><path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3l3 2.7" /></svg>
       </button>
     </div>
   );

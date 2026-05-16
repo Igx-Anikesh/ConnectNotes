@@ -6,9 +6,11 @@ import { BottomBar } from './components/BottomBar'
 import { AgentLog } from './components/AgentLog'
 import { ZoomControls } from './components/ZoomControls'
 import { SidePanel } from './components/SidePanel'
+import { AuthPage } from './components/AuthPage'
 import type { Project } from './components/SidePanel'
 import { useCanvas } from './hooks/useCanvas'
 import { useTools } from './hooks/useTools'
+import { useAuth } from './hooks/useAuth'
 
 export type AppTheme = 'dark' | 'light' | 'custom'
 
@@ -68,7 +70,7 @@ export interface DrawingSettings {
 
 const DRAWING_TOOLS = [
   'rect', 'ellipse', 'triangle', 'line', 'arrow', 
-  'pen', 'brush', 'highlighter', 
+  'pen', 'brush', 'highlighter', 'spray', 'circle_brush',
   'eraser', 'sticky'
 ]
 
@@ -90,7 +92,7 @@ function getOrCreateProject(): Project {
 
   // Create default project
   const project: Project = {
-    id: crypto.randomUUID(),
+    id: Date.now().toString(36) + Math.random().toString(36).substring(2),
     name: 'The Blank Slate',
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -107,6 +109,8 @@ export default function App() {
   const [sidePanelOpen, setSidePanelOpen] = useState(false)
   const [currentProject, setCurrentProject] = useState<Project>(getOrCreateProject)
   const [projectKey, setProjectKey] = useState(0)
+  const [showAuth, setShowAuth] = useState(false)
+  const { user, sendOtp, verifyOtp, updateProfile } = useAuth()
 
   const [theme, setTheme] = useState<AppTheme>(() => localStorage.getItem('draftboard_theme') as AppTheme || 'dark')
   const [customColor, setCustomColor] = useState(() => localStorage.getItem('draftboard_customColor') || '#fff8e7')
@@ -219,7 +223,7 @@ export default function App() {
       }
 
       const newProject: Project = {
-        id: crypto.randomUUID(),
+        id: Date.now().toString(36) + Math.random().toString(36).substring(2),
         name: `Project ${projects.length + 1}`,
         createdAt: Date.now(),
         updatedAt: Date.now(),
@@ -266,8 +270,8 @@ export default function App() {
             <button className="session-btn session-btn--primary" onClick={handleResetSession}>
               Continue as Guest
             </button>
-            <button className="session-btn session-btn--secondary" disabled>
-              Sign In (Coming Soon)
+            <button className="session-btn session-btn--secondary" onClick={() => { setSessionExpired(false); setShowAuth(true); }}>
+              Sign In
             </button>
           </div>
         </div>
@@ -288,7 +292,19 @@ export default function App() {
         onThemeChange={setTheme}
         customColor={customColor}
         onCustomColorChange={setCustomColor}
+        onShowAuth={() => setShowAuth(true)}
+        user={user}
       />
+
+      {showAuth && (
+        <AuthPage 
+          onClose={() => setShowAuth(false)} 
+          onComplete={() => setShowAuth(false)} 
+          sendOtp={sendOtp}
+          verifyOtp={verifyOtp}
+          updateProfile={updateProfile}
+        />
+      )}
 
       {/* Canvas — key forces full remount on project switch */}
       <CanvasArea
@@ -300,16 +316,6 @@ export default function App() {
       >
         {(canvas) => (
           <>
-            {/* Chat bubble */}
-            <div className="chat-bubble" id="chat-bubble" title="Chat">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-                <circle cx="9" cy="10" r="0.5" fill="currentColor" />
-                <circle cx="12" cy="10" r="0.5" fill="currentColor" />
-                <circle cx="15" cy="10" r="0.5" fill="currentColor" />
-              </svg>
-            </div>
-
             {/* UI overlays */}
             <TopNav
               onExport={() => canvas.exportCanvas()}
@@ -318,14 +324,20 @@ export default function App() {
               projectName={currentProject.name}
               onProjectNameChange={handleProjectNameChange}
             />
-            <Toolbar activeTool={activeTool} onSelectTool={selectTool} />
+            <Toolbar 
+              activeTool={activeTool} 
+              onSelectTool={selectTool}
+              onUndo={() => canvas.undo()}
+              onRedo={() => canvas.redo()}
+              canUndo={canvas.canUndo}
+              canRedo={canvas.canRedo}
+            />
             <BottomBar
               isDrawingMode={isDrawingMode}
               activeTool={activeTool}
               drawSettings={drawSettings}
               onDrawSettingsChange={setDrawSettings}
             />
-            <AgentLog />
             <ZoomControls
               zoom={canvas.zoom}
               bgMode={bgMode}

@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@draftboard/shared": "*",
+    "@supabase/supabase-js": "^2.105.3",
     "fabric": "^6.6.3",
     "react": "^19.2.5",
     "react-dom": "^19.2.5"

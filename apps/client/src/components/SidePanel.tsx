@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { AgentLog } from './AgentLog'
 
 export interface Project {
   id: string
@@ -26,6 +27,8 @@ interface SidePanelProps {
   onThemeChange: (theme: 'dark' | 'light' | 'custom') => void
   customColor: string
   onCustomColorChange: (color: string) => void
+  onShowAuth: () => void
+  user: { id: string } | null
 }
 
 const PROJECTS_KEY = 'draftboard_projects'
@@ -68,7 +71,8 @@ function timeAgo(ts: number): string {
 
 export function SidePanel({
   isOpen, onClose, currentProjectId, onSwitchProject, onNewProject,
-  theme, onThemeChange, customColor, onCustomColorChange
+  theme, onThemeChange, customColor, onCustomColorChange,
+  onShowAuth, user
 }: SidePanelProps) {
   const [projects, setProjects] = useState<Project[]>(loadProjects)
   const [meetings, setMeetings] = useState<Meeting[]>(loadMeetings)
@@ -109,7 +113,7 @@ export function SidePanel({
     if (!title || !date) return
 
     const meeting: Meeting = {
-      id: crypto.randomUUID(),
+      id: (Date.now().toString(36) + Math.random().toString(36).substring(2)),
       title,
       scheduledAt: new Date(date).getTime(),
       status: 'scheduled',
@@ -412,12 +416,19 @@ export function SidePanel({
               )}
             </div>
           )}
+          
+          <div style={{ marginBottom: '16px' }}>
+            <AgentLog />
+          </div>
+
           <div className="sidepanel-footer-row">
-            <div className="sidepanel-footer-user">
-              <div className="sidepanel-avatar">G</div>
+            <div className="sidepanel-footer-user" onClick={!user ? () => { onShowAuth(); onClose(); } : undefined} style={{ cursor: !user ? 'pointer' : 'default' }}>
+              <div className="sidepanel-avatar">{user ? user.id[0].toUpperCase() : 'G'}</div>
               <div className="sidepanel-footer-info">
-                <span className="sidepanel-footer-name">Guest User</span>
-                <span className="sidepanel-footer-role">Free Plan</span>
+                <span className="sidepanel-footer-name">{user ? user.id : 'Guest User'}</span>
+                <span className="sidepanel-footer-role" style={{ color: !user ? 'var(--accent-blue)' : undefined }}>
+                  {user ? 'Pro Plan' : 'Sign In / Register'}
+                </span>
               </div>
             </div>
             <button className="footer-settings-btn" onClick={() => setShowTheme(p => !p)} title="Theme Settings">

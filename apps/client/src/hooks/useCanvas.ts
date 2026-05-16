@@ -110,15 +110,47 @@ function recognizeShape(points: {x: number, y: number}[]) {
   }
   const normalizedTriScore = minTriScore / Math.max(w, h);
 
-  // Compare scores and pick the best fit, if within reasonable threshold
-  const scores = [
+  type ShapeData = 
+    | { left: number; top: number; rx: number; ry: number }
+    | { left: number; top: number; width: number; height: number }
+    | { left: number; top: number; width: number; height: number; sides: number };
+
+  const scores: { type: string; score: number; data: ShapeData }[] = [
     { type: 'ellipse', score: ellipseScore, data: { left: minX, top: minY, rx: w/2, ry: h/2 } },
     { type: 'rect', score: normalizedRectScore, data: { left: minX, top: minY, width: w, height: h } },
     { type: 'triangle', score: normalizedTriScore, data: { left: minX, top: minY, width: w, height: h } }
-  ].filter(s => s.score < 0.15).sort((a, b) => a.score - b.score);
+  ];
 
-  if (scores.length > 0) {
-    return { type: scores[0].type, ...scores[0].data };
+  for (let N = 5; N <= 10; N++) {
+    const polyPoints = [];
+    for (let i = 0; i < N; i++) {
+      polyPoints.push({
+        x: cx + (w/2) * Math.cos(2 * Math.PI * i / N - Math.PI / 2),
+        y: cy + (h/2) * Math.sin(2 * Math.PI * i / N - Math.PI / 2)
+      });
+    }
+    let nScore = 0;
+    for (const p of points) {
+      let minDist = Infinity;
+      for (let i = 0; i < N; i++) {
+        const d = distToSegment(p, polyPoints[i], polyPoints[(i+1)%N]);
+        minDist = Math.min(minDist, d);
+      }
+      nScore += minDist;
+    }
+    nScore /= points.length;
+    scores.push({ type: 'polygon', score: nScore / Math.max(w, h), data: { left: minX, top: minY, width: w, height: h, sides: N } });
+  }
+
+  const validScores = scores.filter(s => s.score < 0.25);
+  validScores.forEach(s => {
+    if (s.type === 'polygon' && 'sides' in s.data) s.score *= (1 + s.data.sides * 0.1); 
+    if (s.type === 'ellipse') s.score *= 0.8;
+  });
+  validScores.sort((a, b) => a.score - b.score);
+
+  if (validScores.length > 0) {
+    return { type: validScores[0].type, ...validScores[0].data };
   }
   
   return null;
@@ -145,6 +177,13 @@ export function useCanvas(
   const [state, setState] = useState<CanvasState>({
     zoom: 100, isPanning: false, vpX: 0, vpY: 0,
   });
+  const [canUndo, setCanUndo] = useState(false);
+  const [canRedo, setCanRedo] = useState(false);
+  
+  const historyRef = useRef<string[]>([]);
+  const redoRef = useRef<string[]>([]);
+  const isHistoryRestoring = useRef(false);
+  const lastStateRef = useRef<string | null>(null);
   const drawingOrigin = useRef<{ x: number; y: number } | null>(null);
   const activeShapeRef = useRef<any>(null);
   const panStart = useRef<{ x: number; y: number } | null>(null);
@@ -153,9 +192,13 @@ export function useCanvas(
   const drawSettingsRef = useRef<DrawingSettings>(options.drawSettings);
   const isDrawingNewShape = useRef(false);
   const isEraserDown = useRef(false);
+  const eraserDirty = useRef(false);
   const lastMousePos = useRef<{ x: number; y: number } | null>(null);
-  // Map to track snapped shape → rough draft pairs
-  const draftPairsRef = useRef<Map<any, any>>(new Map());
+  // Ref to hold the most recently created freehand path (for shape recognition pairing)
+  const lastCreatedPathRef = useRef<any>(null);
+  // Refs for undo/redo so keyboard handler always sees latest functions
+  const undoFnRef = useRef<() => void>(() => {});
+  const redoFnRef = useRef<() => void>(() => {});
 
   useEffect(() => { activeToolRef.current = options.activeTool; }, [options.activeTool]);
   useEffect(() => { drawSettingsRef.current = options.drawSettings; }, [options.drawSettings]);
@@ -235,6 +278,15 @@ export function useCanvas(
       });
       canvasRef.current = canvas;
 
+      // Set rotation handle cursor to a rotate icon
+      const rotateCursorSvg = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M23 4v6h-6'/%3E%3Cpath d='M20.49 15a9 9 0 1 1-2.12-9.36L23 10'/%3E%3C/svg%3E") 12 12, crosshair`;
+      try {
+        const mtrControl = fabric.FabricObject.prototype.controls?.mtr;
+        if (mtrControl) {
+          mtrControl.cursorStyle = rotateCursorSvg;
+        }
+      } catch { /* older fabric versions may not support this */ }
+
       // Floating Delete Draft Button
       const draftBtn = document.createElement("button");
       draftBtn.innerHTML = `
@@ -259,64 +311,120 @@ export function useCanvas(
       draftBtn.style.zIndex = "100";
       draftBtn.style.pointerEvents = "auto";
       
-      const draftPairs = draftPairsRef.current;
+      // --- DRAFT PAIRING SYSTEM ---
+      // Both the snapped shape and its draft path carry each other's pairId in .data
+      // snapped shape: data.linkedDraftId = pairId
+      // draft path:    data.linkedShapeId = pairId
+      // This way, selecting either object lets us find the other by scanning canvas.
 
-      const getDraftId = (obj: any): string | null => {
+      let currentDraftActive: any = null;
+
+      /** Given any object, return its pairId if it is part of a draft pair */
+      const getPairId = (obj: any): string | null => {
         const d = obj?.data || obj?.get?.('data');
-        return d?.linkedDraftId || null;
+        if (!d) return null;
+        return d.linkedDraftId || d.linkedShapeId || null;
+      };
+
+      /** Find the partner object on the canvas that shares the same pairId */
+      const findPartner = (obj: any): any | null => {
+        const d = obj?.data || obj?.get?.('data');
+        if (!d) return null;
+        const pairId = d.linkedDraftId || d.linkedShapeId;
+        if (!pairId) return null;
+
+        // Determine which key the partner would have
+        const partnerKey = d.linkedDraftId ? 'linkedShapeId' : 'linkedDraftId';
+
+        for (const o of canvas.getObjects()) {
+          if (o === obj) continue;
+          const od = (o as any).data || (o as any).get?.('data');
+          if (od && od[partnerKey] === pairId) return o;
+          // Also match if partner uses the same pairId on the other key
+          if (od && (od.linkedDraftId === pairId || od.linkedShapeId === pairId)) return o;
+        }
+        return null;
       };
 
       const handleDraftDelete = (e: Event) => {
         e.stopPropagation();
         e.preventDefault();
-        const active = canvas.getActiveObject();
+        const active = canvas.getActiveObject() || currentDraftActive;
         if (!active) return;
-        
-        const draftId = getDraftId(active);
-        if (draftId && draftPairs.has(draftId)) {
-          const draftObj = draftPairs.get(draftId);
-          if (draftObj) {
-            canvas.remove(draftObj);
+
+        const pairId = getPairId(active);
+        if (!pairId) return;
+
+        // Find the draft path partner
+        const partner = findPartner(active);
+
+        const activeData = active?.data || active?.get?.('data');
+
+        if (activeData?.linkedDraftId) {
+          // User selected the SNAPPED shape → delete the DRAFT path (partner)
+          if (partner) canvas.remove(partner);
+          // Clear link from the snapped shape
+          active.set('data', { ...activeData, linkedDraftId: undefined });
+        } else if (activeData?.linkedShapeId) {
+          // User selected the DRAFT path → delete it directly
+          canvas.remove(active);
+          // Clear link from the snapped shape (partner)
+          if (partner) {
+            const pd = partner.data || partner.get?.('data') || {};
+            partner.set('data', { ...pd, linkedDraftId: undefined });
           }
-          draftPairs.delete(draftId);
-          // Also clear the linkage from the snapped shape
-          const activeAny = active as any;
-          const data = activeAny.data || activeAny.get?.('data') || {};
-          activeAny.set("data", { ...data, linkedDraftId: undefined });
-          draftBtn.style.display = "none";
-          canvas.requestRenderAll();
         }
+
+        currentDraftActive = null;
+        draftBtn.style.display = 'none';
+        canvas.discardActiveObject();
+        canvas.requestRenderAll();
       };
 
-      draftBtn.onpointerdown = handleDraftDelete;
-      draftBtn.onmousedown = (e) => e.stopPropagation();
-      draftBtn.onclick = handleDraftDelete;
-      draftBtn.ontouchstart = handleDraftDelete;
+      draftBtn.addEventListener('pointerdown', handleDraftDelete, { capture: true });
+      draftBtn.addEventListener('mousedown', (e) => e.stopPropagation(), { capture: true });
+      draftBtn.addEventListener('click', handleDraftDelete, { capture: true });
+      draftBtn.addEventListener('touchstart', handleDraftDelete, { capture: true });
       
       container.appendChild(draftBtn);
 
       const updateDraftBtn = () => {
         const active = canvas.getActiveObject();
-        if (!active) { draftBtn.style.display = "none"; return; }
-        
-        const draftId = getDraftId(active);
-        if (draftId && draftPairs.has(draftId)) {
-           const bound = active.getBoundingRect();
-           draftBtn.style.display = "flex";
-           setTimeout(() => {
-             if (draftBtn.style.display === "flex") {
-               draftBtn.style.left = `${bound.left + bound.width + 15}px`;
-               draftBtn.style.top = `${bound.top + bound.height / 2 - draftBtn.offsetHeight / 2}px`;
-             }
-           }, 0);
+        if (!active) {
+          // Delayed hide — give time for button click to fire first
+          setTimeout(() => {
+            if (!canvas.getActiveObject()) {
+              draftBtn.style.display = 'none';
+              currentDraftActive = null;
+            }
+          }, 150);
+          return;
+        }
+        currentDraftActive = active;
+
+        const pairId = getPairId(active);
+        const partner = pairId ? findPartner(active) : null;
+
+        if (pairId && partner) {
+          const bound = active.getBoundingRect();
+          draftBtn.style.display = 'flex';
+          requestAnimationFrame(() => {
+            if (draftBtn.style.display === 'flex') {
+              draftBtn.style.left = `${bound.left + bound.width + 15}px`;
+              draftBtn.style.top = `${bound.top + bound.height / 2 - draftBtn.offsetHeight / 2}px`;
+            }
+          });
         } else {
-           draftBtn.style.display = "none";
+          draftBtn.style.display = 'none';
         }
       };
 
-      canvas.on("after:render", updateDraftBtn);
+      canvas.on('selection:created', updateDraftBtn);
+      canvas.on('selection:updated', updateDraftBtn);
+      canvas.on('selection:cleared', updateDraftBtn);
+      canvas.on('object:moving', updateDraftBtn);
 
-      // ── AUTO-SAVE ──
+      // ── AUTO-SAVE & HISTORY ──
       let saveTimeout: ReturnType<typeof setTimeout> | null = null;
       const autoSave = () => {
         if (saveTimeout) clearTimeout(saveTimeout);
@@ -328,17 +436,44 @@ export function useCanvas(
           } catch (err) { /* silently fail for quota */ }
         }, 1000);
       };
-      canvas.on('object:added', autoSave);
-      canvas.on('object:modified', autoSave);
-      canvas.on('object:removed', autoSave);
+      (canvas as any).__autoSave = autoSave;
+
+      const saveHistory = () => {
+        if (isHistoryRestoring.current) return;
+        if (lastStateRef.current) {
+          historyRef.current.push(lastStateRef.current);
+          if (historyRef.current.length > 50) historyRef.current.shift();
+        }
+        const currentState = JSON.stringify((canvas as any).toJSON(['data']));
+        lastStateRef.current = currentState;
+        redoRef.current = [];
+        setCanUndo(historyRef.current.length > 0);
+        setCanRedo(false);
+      };
+
+      const onCanvasChange = () => {
+        if (!isHistoryRestoring.current) {
+          saveHistory();
+          autoSave();
+        }
+      };
+
+      canvas.on('object:added', onCanvasChange);
+      canvas.on('object:modified', onCanvasChange);
+      canvas.on('object:removed', onCanvasChange);
 
       // ── LOAD SAVED DATA ──
       try {
         const saved = localStorage.getItem('draftboard_canvas');
         if (saved) {
+          isHistoryRestoring.current = true;
           canvas.loadFromJSON(JSON.parse(saved)).then(() => {
             canvas.renderAll();
-          }).catch(() => {});
+            lastStateRef.current = JSON.stringify((canvas as any).toJSON(['data']));
+            isHistoryRestoring.current = false;
+          }).catch(() => { isHistoryRestoring.current = false; });
+        } else {
+          lastStateRef.current = JSON.stringify((canvas as any).toJSON(['data']));
         }
       } catch (err) { /* ignore corrupt data */ }
 
@@ -368,8 +503,14 @@ export function useCanvas(
 
         if (tool === "eraser") {
           isEraserDown.current = true;
+          eraserDirty.current = false;
           const target = canvas.findTarget(e.e);
-          if (target) { canvas.remove(target); canvas.renderAll(); }
+          if (target) {
+            isHistoryRestoring.current = true;
+            canvas.remove(target);
+            canvas.renderAll();
+            eraserDirty.current = true;
+          }
           return;
         }
 
@@ -425,7 +566,7 @@ export function useCanvas(
           }
 
           if (shape) {
-            shape.set("data", { id: crypto.randomUUID(), type: tool });
+            shape.set("data", { id: (Date.now().toString(36) + Math.random().toString(36).substring(2)), type: tool });
             canvas.add(shape);
             activeShapeRef.current = shape;
           }
@@ -439,12 +580,19 @@ export function useCanvas(
             fill: ds.strokeColor, editable: true,
             selectable: true, evented: true,
           });
-          textbox.set("data", { id: crypto.randomUUID(), type: "text" });
+          textbox.set("data", { id: (Date.now().toString(36) + Math.random().toString(36).substring(2)), type: "text" });
           canvas.add(textbox);
           canvas.setActiveObject(textbox);
           textbox.enterEditing();
           textbox.selectAll();
           canvas.renderAll();
+        }
+      });
+
+      // ── CAPTURE FREEHAND PATHS for draft pairing ──
+      canvas.on("path:created", (opt: any) => {
+        if (opt.path) {
+          lastCreatedPathRef.current = opt.path;
         }
       });
 
@@ -462,23 +610,16 @@ export function useCanvas(
               if (brush && brush._points && brush._points.length > 20) {
                 const shapeDef = recognizeShape(brush._points);
                 if (shapeDef) {
-                  // Snapshot the object count BEFORE the brush finalizes
-                  const objCountBefore = canvas.getObjects().length;
+                  // Clear the lastCreatedPath ref so we can capture the new one
+                  lastCreatedPathRef.current = null;
                   
                   try { brush.onMouseUp({ e: e.e }); } catch(err) {}
                   isDrawingMouseDown = false;
                   
-                  // Use a longer wait + polling to ensure Fabric has added the path
+                  // Wait for Fabric's path:created event to fire and populate lastCreatedPathRef
                   const findAndReplace = () => {
-                    const objs = canvas.getObjects();
-                    // The rough draft is any new path added since we snapshotted
-                    let roughDraftObj: any = null;
-                    if (objs.length > objCountBefore) {
-                      const candidate = objs[objs.length - 1];
-                      if (candidate && candidate.type === 'path') {
-                        roughDraftObj = candidate;
-                      }
-                    }
+                    const roughDraftObj = lastCreatedPathRef.current;
+                    lastCreatedPathRef.current = null;
                     
                     const ds = drawSettingsRef.current;
                     let newShape: any;
@@ -517,26 +658,43 @@ export function useCanvas(
                       newShape = new fabricModRef.current.Line([def.x1!, def.y1!, def.x2!, def.y2!], {
                         stroke: strokeColor, strokeWidth: strokeWidth, opacity: opacity
                       });
+                    } else if (shapeDef.type === 'polygon') {
+                      const N = def.sides;
+                      const polyPts = [];
+                      for (let i = 0; i < N; i++) {
+                        polyPts.push({
+                          x: def.left + def.width/2 + (def.width/2) * Math.cos(2 * Math.PI * i / N - Math.PI / 2),
+                          y: def.top + def.height/2 + (def.height/2) * Math.sin(2 * Math.PI * i / N - Math.PI / 2)
+                        });
+                      }
+                      newShape = new fabricModRef.current.Polygon(polyPts, {
+                        fill: ds.fillColor, stroke: strokeColor, strokeWidth: strokeWidth,
+                        opacity: opacity
+                      });
                     }
                     
                     if (newShape) {
-                      const draftId = crypto.randomUUID();
-                      newShape.set("data", { id: crypto.randomUUID(), type: shapeDef.type, linkedDraftId: draftId });
+                      // Generate a unique pairId that links the snapped shape ↔ draft path
+                      const pairId = (Date.now().toString(36) + Math.random().toString(36).substring(2));
+                      const shapeId = (Date.now().toString(36) + Math.random().toString(36).substring(2) + 's');
                       
+                      // Tag the snapped shape: linkedDraftId points to the pair
+                      newShape.set('data', { id: shapeId, type: shapeDef.type, linkedDraftId: pairId });
+                      
+                      // Tag the draft path: linkedShapeId points to the same pair
                       if (roughDraftObj) {
-                        // Tag the rough draft with the draftId and store in map
-                        roughDraftObj.set("data", { ...(roughDraftObj.data || {}), draftId: draftId });
-                        draftPairsRef.current.set(draftId, roughDraftObj);
+                        const existingData = roughDraftObj.data || roughDraftObj.get?.('data') || {};
+                        roughDraftObj.set('data', { ...existingData, linkedShapeId: pairId });
                       }
                       
                       canvas.add(newShape);
                       canvas.setActiveObject(newShape);
-                      canvas.renderAll();
+                      canvas.requestRenderAll();
                     }
                   };
                   
-                  // Wait 50ms for Fabric to finalize the path, then run
-                  setTimeout(findAndReplace, 50);
+                  // Wait 120ms for Fabric's path:created event to fire
+                  setTimeout(findAndReplace, 120);
                 }
               }
             }
@@ -546,7 +704,11 @@ export function useCanvas(
         // Swipe eraser: delete anything the cursor passes over while held
         if (tool === "eraser" && isEraserDown.current) {
           const target = canvas.findTarget(e.e);
-          if (target) { canvas.remove(target); canvas.renderAll(); }
+          if (target) {
+            canvas.remove(target);
+            canvas.renderAll();
+            eraserDirty.current = true;
+          }
           return;
         }
 
@@ -600,9 +762,16 @@ export function useCanvas(
 
         const tool = activeToolRef.current;
 
-        // Reset eraser swipe state
+        // Reset eraser swipe state — commit one history entry for the whole stroke
         if (tool === "eraser") {
           isEraserDown.current = false;
+          if (eraserDirty.current) {
+            isHistoryRestoring.current = false;
+            // Manually save one history snapshot for everything that was erased
+            saveHistory();
+            autoSave();
+            eraserDirty.current = false;
+          }
           return;
         }
 
@@ -632,6 +801,56 @@ export function useCanvas(
         isDrawingNewShape.current = false;
         drawingOrigin.current = null;
         canvas.renderAll();
+      });
+
+      // ── TOUCH (PINCH TO ZOOM & TWO-FINGER PAN) ──
+      let initialPinchDistance = 0;
+      let initialZoom = 1;
+      let lastTouchCenter = { x: 0, y: 0 };
+
+      container.addEventListener('touchstart', (e) => {
+        if (e.touches.length === 2) {
+          e.preventDefault();
+          const t1 = e.touches[0];
+          const t2 = e.touches[1];
+          initialPinchDistance = Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
+          initialZoom = canvas.getZoom();
+          lastTouchCenter = { x: (t1.clientX + t2.clientX) / 2, y: (t1.clientY + t2.clientY) / 2 };
+        }
+      }, { passive: false });
+
+      container.addEventListener('touchmove', (e) => {
+        if (e.touches.length === 2) {
+          e.preventDefault();
+          const t1 = e.touches[0];
+          const t2 = e.touches[1];
+          const currentDistance = Math.hypot(t1.clientX - t2.clientX, t1.clientY - t2.clientY);
+          const currentCenter = { x: (t1.clientX + t2.clientX) / 2, y: (t1.clientY + t2.clientY) / 2 };
+          
+          if (initialPinchDistance > 0) {
+            let zoom = initialZoom * (currentDistance / initialPinchDistance);
+            zoom = Math.min(Math.max(zoom, 0.25), 5);
+            const point = new (fabricModRef.current.Point)(currentCenter.x, currentCenter.y);
+            canvas.zoomToPoint(point, zoom);
+          }
+
+          const dx = currentCenter.x - lastTouchCenter.x;
+          const dy = currentCenter.y - lastTouchCenter.y;
+          const vpt = [...canvas.viewportTransform!];
+          vpt[4] += dx;
+          vpt[5] += dy;
+          canvas.setViewportTransform(vpt as [number, number, number, number, number, number]);
+          
+          lastTouchCenter = currentCenter;
+          clampViewport(canvas);
+          syncViewport(canvas);
+        }
+      }, { passive: false });
+
+      container.addEventListener('touchend', (e) => {
+        if (e.touches.length < 2) {
+          initialPinchDistance = 0;
+        }
       });
 
       // ── WHEEL (PAN / ZOOM) ──
@@ -664,11 +883,72 @@ export function useCanvas(
         }
       });
 
-      // Delete
+      // Key events for Undo/Redo, Delete, and Duplicate
       const onKey = (ev: KeyboardEvent) => {
+        const target = ev.target as HTMLElement;
+        const isInput = target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable;
+        const active = canvas.getActiveObject();
+        const isEditingCanvasText = active && (active as any).isEditing;
+
+        if (!isInput && !isEditingCanvasText) {
+          // Ctrl+Z / Ctrl+Shift+Z
+          if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "z") {
+            ev.preventDefault();
+            if (ev.shiftKey) {
+              redoFnRef.current();
+            } else {
+              undoFnRef.current();
+            }
+            return;
+          }
+          // Ctrl+Y
+          if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "y") {
+            ev.preventDefault();
+            redoFnRef.current();
+            return;
+          }
+          // Shift+D — Duplicate selected objects
+          if (ev.shiftKey && ev.key.toLowerCase() === "d") {
+            ev.preventDefault();
+            const activeObjs = canvas.getActiveObjects();
+            if (activeObjs.length === 0) return;
+            canvas.discardActiveObject();
+            const clones: any[] = [];
+            let remaining = activeObjs.length;
+            activeObjs.forEach((obj: any) => {
+              obj.clone().then((cloned: any) => {
+                cloned.set({
+                  left: (cloned.left || 0) + 20,
+                  top: (cloned.top || 0) + 20,
+                  evented: true,
+                  selectable: true,
+                });
+                // Give clone a new unique id
+                const existingData = cloned.data || {};
+                cloned.set('data', {
+                  ...existingData,
+                  id: Date.now().toString(36) + Math.random().toString(36).substring(2),
+                });
+                canvas.add(cloned);
+                clones.push(cloned);
+                remaining--;
+                if (remaining === 0) {
+                  if (clones.length === 1) {
+                    canvas.setActiveObject(clones[0]);
+                  } else {
+                    const sel = new (fabricModRef.current.ActiveSelection)(clones, { canvas });
+                    canvas.setActiveObject(sel);
+                  }
+                  canvas.requestRenderAll();
+                }
+              });
+            });
+            return;
+          }
+        }
+
         if (ev.key === "Delete" || ev.key === "Backspace") {
-          const active = canvas.getActiveObject();
-          if (active && (active as any).isEditing) return;
+          if (isEditingCanvasText || isInput) return;
           canvas.getActiveObjects().forEach((obj: any) => canvas.remove(obj));
           canvas.discardActiveObject();
           canvas.renderAll();
@@ -715,26 +995,40 @@ export function useCanvas(
     canvas.isDrawingMode = false;
     canvas.selection = options.activeTool === "select";
 
-    const isPenMode = ["pen", "brush", "highlighter"].includes(options.activeTool);
+    const isPenMode = ["pen", "brush", "highlighter", "spray", "circle_brush"].includes(options.activeTool);
     canvas.isDrawingMode = isPenMode;
 
     if (isPenMode) {
-      const brush = new fabric.PencilBrush(canvas);
-      if (options.activeTool === "highlighter") {
-        let color = options.drawSettings.strokeColor;
-        if (color.startsWith("#") && color.length === 7) {
-          color = color + "66"; // 40% opacity
-        }
-        brush.color = color;
-        brush.width = options.drawSettings.strokeWidth * 3 + 10;
-      } else if (options.activeTool === "brush") {
-        brush.color = options.drawSettings.strokeColor;
-        brush.width = options.drawSettings.strokeWidth * 2 + 5;
+      let newBrush: any;
+
+      if (options.activeTool === "spray") {
+        newBrush = new fabric.SprayBrush(canvas);
+        newBrush.color = options.drawSettings.strokeColor;
+        newBrush.width = options.drawSettings.strokeWidth * 4 + 15;
+        newBrush.density = 20;
+        newBrush.dotWidthVariance = 3;
+      } else if (options.activeTool === "circle_brush") {
+        newBrush = new fabric.CircleBrush(canvas);
+        newBrush.color = options.drawSettings.strokeColor;
+        newBrush.width = options.drawSettings.strokeWidth * 3 + 8;
       } else {
-        brush.color = options.drawSettings.strokeColor;
-        brush.width = options.drawSettings.strokeWidth;
+        newBrush = new fabric.PencilBrush(canvas);
+        if (options.activeTool === "highlighter") {
+          let color = options.drawSettings.strokeColor;
+          if (color.startsWith("#") && color.length === 7) {
+            color = color + "66"; // 40% opacity
+          }
+          newBrush.color = color;
+          newBrush.width = options.drawSettings.strokeWidth * 3 + 10;
+        } else if (options.activeTool === "brush") {
+          newBrush.color = options.drawSettings.strokeColor;
+          newBrush.width = options.drawSettings.strokeWidth * 2 + 5;
+        } else {
+          newBrush.color = options.drawSettings.strokeColor;
+          newBrush.width = options.drawSettings.strokeWidth;
+        }
       }
-      canvas.freeDrawingBrush = brush;
+      canvas.freeDrawingBrush = newBrush;
     }
 
     const interactable = options.activeTool === "select" ||
@@ -770,22 +1064,25 @@ export function useCanvas(
     syncViewport(canvas);
   }, [syncViewport]);
 
-  // ── Helper: render content to a data URL with smart cropping ──
-  const renderToImage = useCallback((): string | null => {
+  // ── Helper: render content to a data URL with smart cropping (ASYNC) ──
+  const renderToImage = useCallback(async (): Promise<string | null> => {
     const canvas = canvasRef.current;
     if (!canvas) return null;
 
     const objects = canvas.getObjects();
     if (objects.length === 0) return null;
 
-    // 1. Reset viewport to identity so getBoundingRect is in world coords
-    const prevVpt = [...canvas.viewportTransform!];
-    const prevBg = canvas.backgroundColor;
+    // 1. Save current state
+    const prevVpt = [...canvas.viewportTransform!] as [number, number, number, number, number, number];
+    const prevW = canvas.getWidth();
+    const prevH = canvas.getHeight();
     canvas.discardActiveObject();
+
+    // 2. Reset viewport to identity so we can measure in world coords
     canvas.setViewportTransform([1, 0, 0, 1, 0, 0]);
     canvas.renderAll();
 
-    // 2. Calculate tight bounding box of ALL content
+    // 3. Calculate tight bounding box of ALL content (world coords)
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     objects.forEach((obj: any) => {
       const bound = obj.getBoundingRect();
@@ -795,51 +1092,92 @@ export function useCanvas(
       maxY = Math.max(maxY, bound.top + bound.height);
     });
 
-    // 3. Define margin (40px on each side)
-    const margin = 40;
+    // 4. Margin around content
+    const margin = 60;
     const contentW = maxX - minX;
     const contentH = maxY - minY;
     const exportW = contentW + margin * 2;
     const exportH = contentH + margin * 2;
 
-    // 4. Create offscreen canvas at 2x resolution
+    // 5. Get the actual background color the user sees from CSS
+    const rootStyle = getComputedStyle(document.documentElement);
+    const bgColor = rootStyle.getPropertyValue('--canvas-bg').trim() || '#0d0d0d';
+
+    // 6. Temporarily resize the Fabric canvas to fit ALL content
+    //    and shift the viewport so the content area starts at (margin, margin)
+    canvas.setDimensions({ width: exportW, height: exportH });
+    canvas.setViewportTransform([1, 0, 0, 1, -minX + margin, -minY + margin]);
+    canvas.backgroundColor = bgColor;
+    canvas.renderAll();
+
+    // 7. Render to data URL at 2x for high quality
     const scale = 2;
-    const offscreen = document.createElement('canvas');
-    offscreen.width = exportW * scale;
-    offscreen.height = exportH * scale;
-    const ctx = offscreen.getContext('2d')!;
-
-    // 5. Fill background
-    ctx.fillStyle = '#0d0d0d';
-    ctx.fillRect(0, 0, offscreen.width, offscreen.height);
-
-    // 6. Render Fabric canvas to a temp full image, then crop
     const fullDataURL = canvas.toDataURL({ format: 'png', multiplier: scale });
 
-    // Restore viewport immediately
-    canvas.backgroundColor = prevBg;
+    // 8. Restore everything immediately
+    canvas.backgroundColor = 'transparent';
+    canvas.setDimensions({ width: prevW, height: prevH });
     canvas.setViewportTransform(prevVpt);
     canvas.renderAll();
 
-    // 7. Draw the cropped region onto the offscreen canvas
-    const img = new Image();
-    img.src = fullDataURL;
-
-    // Since img.src is a data URL, it loads synchronously in most browsers
-    // but let's use a synchronous approach by drawing directly
-    ctx.drawImage(
-      img,
-      minX * scale, minY * scale,         // source x, y
-      contentW * scale, contentH * scale,  // source w, h
-      margin * scale, margin * scale,      // dest x, y
-      contentW * scale, contentH * scale   // dest w, h
-    );
-
-    return offscreen.toDataURL('image/png', 1.0);
+    // 9. Wait for image load and return
+    return new Promise<string | null>((resolve) => {
+      const img = new Image();
+      img.onload = () => resolve(img.src);
+      img.onerror = () => resolve(null);
+      img.src = fullDataURL;
+    });
   }, []);
 
+  // ── UNDO / REDO ──
+  const undo = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || historyRef.current.length === 0) return;
+    
+    isHistoryRestoring.current = true;
+    const currentState = lastStateRef.current || JSON.stringify((canvas as any).toJSON(['data']));
+    redoRef.current.push(currentState);
+    
+    const prevState = historyRef.current.pop()!;
+    lastStateRef.current = prevState;
+    
+    canvas.loadFromJSON(JSON.parse(prevState)).then(() => {
+      canvas.renderAll();
+      isHistoryRestoring.current = false;
+      setCanUndo(historyRef.current.length > 0);
+      setCanRedo(redoRef.current.length > 0);
+      if (canvas.__autoSave) canvas.__autoSave();
+    });
+  }, []);
+
+  const redo = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || redoRef.current.length === 0) return;
+
+    isHistoryRestoring.current = true;
+    const currentState = lastStateRef.current || JSON.stringify((canvas as any).toJSON(['data']));
+    historyRef.current.push(currentState);
+
+    const nextState = redoRef.current.pop()!;
+    lastStateRef.current = nextState;
+
+    canvas.loadFromJSON(JSON.parse(nextState)).then(() => {
+      canvas.renderAll();
+      isHistoryRestoring.current = false;
+      setCanUndo(historyRef.current.length > 0);
+      setCanRedo(redoRef.current.length > 0);
+      if (canvas.__autoSave) canvas.__autoSave();
+    });
+  }, []);
+
+  // Keep refs in sync so keyboard handler always calls the latest undo/redo
+  useEffect(() => {
+    undoFnRef.current = undo;
+    redoFnRef.current = redo;
+  }, [undo, redo]);
+
   // ── EXPORT AS PNG ──
-  const exportCanvas = useCallback(() => {
+  const exportCanvas = useCallback(async () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
@@ -850,7 +1188,7 @@ export function useCanvas(
     }
 
     try {
-      const dataURL = renderToImage();
+      const dataURL = await renderToImage();
       if (!dataURL) {
         alert("Export failed — couldn't render content.");
         return;
@@ -880,7 +1218,7 @@ export function useCanvas(
     }
 
     try {
-      const dataURL = renderToImage();
+      const dataURL = await renderToImage();
       if (!dataURL) {
         alert("Share failed — couldn't render content.");
         return;
@@ -921,5 +1259,9 @@ export function useCanvas(
     resetView,
     exportCanvas,
     shareCanvas,
+    undo,
+    redo,
+    canUndo,
+    canRedo,
   };
 }

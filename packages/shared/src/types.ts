@@ -12,6 +12,8 @@ export type ToolType =
   | 'pen'
   | 'brush'
   | 'highlighter'
+  | 'spray'
+  | 'circle_brush'
   | 'sticky'
   | 'eraser';
 

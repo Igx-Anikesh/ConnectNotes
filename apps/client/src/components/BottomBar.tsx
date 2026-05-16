@@ -3,6 +3,19 @@
 import { useState, useEffect, useRef } from 'react'
 import type { DrawingSettings } from '../App'
 
+const FILL_PALETTE = [
+  '#4a9eff',  // blue
+  '#34d399',  // green
+  '#f59e0b',  // amber
+  '#ef4444',  // red
+  '#a78bfa',  // purple
+  '#f472b6',  // pink
+  '#fb923c',  // orange
+  '#22d3ee',  // cyan
+  '#e8e8e8',  // white-ish
+  '#0d0d0d',  // black
+]
+
 interface BottomBarProps {
   isDrawingMode: boolean
   activeTool: string
@@ -11,11 +24,11 @@ interface BottomBarProps {
 }
 
 const QUICK_COLORS = [
-  '#e8e8e8',  // white-ish
-  '#4a9eff',  // blue
-  '#34d399',  // green
-  '#f59e0b',  // amber
-  '#ef4444',  // red
+  '#e8e8e8',
+  '#4a9eff',
+  '#34d399',
+  '#f59e0b',
+  '#ef4444',
 ]
 
 const STROKE_WIDTHS = [1, 2, 4, 8, 12]
@@ -34,14 +47,36 @@ const FONT_SIZES = [16, 24, 32, 48, 64]
 
 export function BottomBar({ isDrawingMode, activeTool, drawSettings, onDrawSettingsChange }: BottomBarProps) {
   const [showPrompt, setShowPrompt] = useState(false)
+  const [showFillPopover, setShowFillPopover] = useState(false)
   const colorInputRef = useRef<HTMLInputElement>(null)
-  
+  const fillColorInputRef = useRef<HTMLInputElement>(null)
+  const fillWrapperRef = useRef<HTMLDivElement>(null)
+
   const isTextMode = activeTool === 'text'
   const isDrawOrTextMode = isDrawingMode || isTextMode
+  const hasFill = drawSettings.fillColor !== 'transparent'
 
   useEffect(() => {
     setShowPrompt(false)
+    setShowFillPopover(false)
   }, [isDrawOrTextMode, activeTool])
+
+  // Close popover on outside click
+  useEffect(() => {
+    if (!showFillPopover) return
+    const handler = (e: MouseEvent) => {
+      if (fillWrapperRef.current && !fillWrapperRef.current.contains(e.target as Node)) {
+        setShowFillPopover(false)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [showFillPopover])
+
+  // Get base fill hex (strip alpha suffix)
+  const currentFillHex = hasFill
+    ? (drawSettings.fillColor.length === 9 ? drawSettings.fillColor.slice(0, 7) : drawSettings.fillColor)
+    : null
 
   const showingPrompt = !isDrawOrTextMode || showPrompt
 
@@ -195,13 +230,17 @@ export function BottomBar({ isDrawingMode, activeTool, drawSettings, onDrawSetti
           </>
         ) : (
           <>
-            {/* Fill toggle */}
-            <div className="draw-section">
+            {/* Fill toggle — just a button, popover floats above */}
+            <div className="draw-section fill-section" ref={fillWrapperRef}>
               <span className="draw-label">Fill</span>
               <div className="fill-options">
+                {/* No fill */}
                 <button
-                  className={`fill-btn ${drawSettings.fillColor === 'transparent' ? 'active' : ''}`}
-                  onClick={() => onDrawSettingsChange({ ...drawSettings, fillColor: 'transparent' })}
+                  className={`fill-btn ${!hasFill ? 'active' : ''}`}
+                  onClick={() => {
+                    onDrawSettingsChange({ ...drawSettings, fillColor: 'transparent' })
+                    setShowFillPopover(false)
+                  }}
                   title="No fill"
                 >
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -209,16 +248,64 @@ export function BottomBar({ isDrawingMode, activeTool, drawSettings, onDrawSetti
                     <line x1="3" y1="21" x2="21" y2="3" />
                   </svg>
                 </button>
+                {/* Fill toggle — shows indicator color dot */}
                 <button
-                  className={`fill-btn ${drawSettings.fillColor !== 'transparent' ? 'active' : ''}`}
-                  onClick={() => onDrawSettingsChange({ ...drawSettings, fillColor: drawSettings.strokeColor + '33' })}
-                  title="Filled"
+                  className={`fill-btn ${hasFill ? 'active' : ''}`}
+                  onClick={() => {
+                    if (!hasFill) {
+                      onDrawSettingsChange({ ...drawSettings, fillColor: drawSettings.strokeColor + '33' })
+                    }
+                    setShowFillPopover(!showFillPopover)
+                  }}
+                  title="Fill color"
                 >
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="2">
-                    <rect x="3" y="3" width="18" height="18" rx="2" />
-                  </svg>
+                  {hasFill ? (
+                    <span
+                      className="fill-indicator"
+                      style={{ background: currentFillHex || drawSettings.strokeColor }}
+                    />
+                  ) : (
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="2">
+                      <rect x="3" y="3" width="18" height="18" rx="2" />
+                    </svg>
+                  )}
                 </button>
               </div>
+
+              {/* ── Fill Color Popover ── */}
+              {showFillPopover && (
+                <div className="fill-popover">
+                  <div className="fill-popover-header">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z" />
+                    </svg>
+                    Fill Color
+                  </div>
+                  <div className="fill-popover-grid">
+                    {FILL_PALETTE.map((color) => (
+                      <button
+                        key={color}
+                        className={`fill-popover-swatch ${currentFillHex === color ? 'active' : ''}`}
+                        style={{ background: color }}
+                        onClick={() => onDrawSettingsChange({ ...drawSettings, fillColor: color + '33' })}
+                        title={color}
+                      />
+                    ))}
+                    {/* Inline custom color picker */}
+                    <div className="fill-popover-picker-wrapper">
+                      <input
+                        ref={fillColorInputRef}
+                        type="color"
+                        value={currentFillHex || '#888888'}
+                        onChange={(e) => onDrawSettingsChange({ ...drawSettings, fillColor: e.target.value + '33' })}
+                        className="fill-popover-picker"
+                        title="Pick custom color"
+                      />
+                      <span className="fill-popover-picker-label">+</span>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="draw-divider" />
